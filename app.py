@@ -91,7 +91,6 @@ def safe_get(info: dict, key: str, default=None):
     """
     try:
         value = info.get(key, default)
-        # Some fields can be None or NaN
         if value is None:
             return default
         if isinstance(value, float) and np.isnan(value):
@@ -128,21 +127,18 @@ def score_margin(margin: float) -> float:
     """
     if margin is None:
         return 50.0
-    # Cap at 40% margin
-    margin = max(min(margin, 0.4), -0.4)
-    # Map [-40%, 40%] to [0, 100]
-    return (margin + 0.4) / 0.8 * 100.0
+    margin = max(min(margin, 0.4), -0.4)   # cap between -40% and +40%
+    return (margin + 0.4) / 0.8 * 100.0    # map [-0.4, 0.4] to [0, 100]
 
 
 def score_growth(growth: float) -> float:
     """
-    Score revenue or earnings growth (approx in 0-1 range) into 0-100.
+    Score revenue or earnings growth into 0-100.
     """
     if growth is None:
         return 50.0
-    # Cap growth between -50% and +50%
-    growth = max(min(growth, 0.5), -0.5)
-    return (growth + 0.5) / 1.0 * 100.0
+    growth = max(min(growth, 0.5), -0.5)   # cap between -50% and +50%
+    return (growth + 0.5) / 1.0 * 100.0    # map [-0.5, 0.5] to [0, 100]
 
 
 def score_debt_to_equity(de: float) -> float:
@@ -169,7 +165,7 @@ def get_fundamental_scores(ticker: str):
     """
     try:
         tk = yf.Ticker(ticker)
-        info = tk.info  # may be slow / partial but works for many tickers
+        info = tk.info
     except Exception:
         info = {}
 
@@ -186,7 +182,6 @@ def get_fundamental_scores(ticker: str):
     growth_score = score_growth(revenue_growth)
     de_score = score_debt_to_equity(debt_to_equity)
 
-    # Aggregate factor score as simple average of available scores
     scores = [trailing_pe_score, forward_pe_score, margin_score, growth_score, de_score]
     valid_scores = [s for s in scores if s is not None]
 
@@ -236,13 +231,19 @@ def train_model_v2(X: pd.DataFrame, y: pd.Series, test_size: float = 0.2, random
 
     model.fit(X_train, y_train)
 
-    # Evaluate on hold-out test set
+    # Predictions on hold-out test set
     y_pred = model.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
 
-    # Brier score for probability calibration (on class 1 = "UP")
+    # Ensure y_test is 1D
+    y_test_1d = np.ravel(y_test)
+
+    # Accuracy
+    acc = accuracy_score(y_test_1d, y_pred)
+
+    # Brier score for probability calibration (class 1 = "UP")
     proba_test = model.predict_proba(X_test)[:, 1]
-    brier = brier_score_loss(y_test, proba_test)
+    proba_test_1d = np.ravel(proba_test)
+    brier = brier_score_loss(y_test_1d, proba_test_1d)
 
     return model, acc, brier
 
@@ -325,7 +326,7 @@ def main():
                 if len(df) < 150:
                     st.warning(
                         "Not much historical data available after feature engineering. "
-                        "Predictions and calibration may be unreliable."
+                        "Predictions and calibration may be less reliable."
                     )
 
                 # 3) Train model (ML)
@@ -334,8 +335,7 @@ def main():
                 # 4) Predict next day via ML
                 direction_ml, confidence_ml, p_up, p_down = predict_next_day_v2(model, X)
 
-                # 5) Compute ML-based score (1-100). p_up in [0,1]:
-                # p_up = 0.5 -> 50 (neutral), p_up close to 1 -> 100, p_up close to 0 -> 0
+                # 5) ML-based score (1–100) from p_up
                 ml_score = p_up * 100.0
 
                 # 6) Fundamentals factor score
@@ -348,15 +348,10 @@ def main():
                 # 8) Direction from final score
                 direction_final = "UP" if final_score > 50.0 else "DOWN"
 
-                # 9) Confidence percentage (blend of ML margin and Brier calibration)
-                # Model confidence based on distance from 50% probability
-                model_margin = abs(p_up - 0.5) * 2.0  # 0 (uncertain) to 1 (very certain)
-
-                # Brier score: lower is better; we invert it for confidence contribution
-                # Clip to [0, 1] range for safety
+                # 9) Confidence percentage: blend of ML margin and calibration (Brier)
+                model_margin = abs(p_up - 0.5) * 2.0  # 0 to 1
                 brier_clipped = float(np.clip(brier, 0.0, 1.0))
                 calibration_factor = 1.0 - brier_clipped  # higher is better
-
                 raw_confidence = model_margin * calibration_factor
                 confidence_pct = float(np.clip(raw_confidence * 100.0, 0.0, 100.0))
 
@@ -414,7 +409,7 @@ def main():
             "to produce a 1–100 rating, where 1 = very bearish, 50 = neutral, 100 = very bullish."
         )
 
-        # Show fundamental details
+        # Fundamental details table
         st.markdown("#### Fundamental factors (raw + scores)")
         factor_table = pd.DataFrame({
             "metric": [
@@ -446,7 +441,6 @@ def main():
 
         price_to_show = df[["Close"]].copy()
         try:
-            # Handle possible timezone issues for plotting
             price_to_show.index = price_to_show.index.tz_localize(None)
         except Exception:
             pass
