@@ -41,5 +41,5 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def build_features_v2(data: pd.DataFrame):
-    """
+    ""
     Build feature set and target for the ML model.
