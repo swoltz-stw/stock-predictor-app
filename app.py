@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, brier_score_loss
 
 
 # =========================
@@ -81,9 +81,144 @@ def build_features_v2(data: pd.DataFrame):
     return df, X, y, feature_cols
 
 
+# =========================
+# Fundamental Factor Scoring
+# =========================
+
+def safe_get(info: dict, key: str, default=None):
+    """
+    Safe dictionary access for yfinance .info.
+    """
+    try:
+        value = info.get(key, default)
+        # Some fields can be None or NaN
+        if value is None:
+            return default
+        if isinstance(value, float) and np.isnan(value):
+            return default
+        return value
+    except Exception:
+        return default
+
+
+def score_pe(pe: float) -> float:
+    """
+    Heuristic scoring for P/E:
+    Lower is generally better up to a point.
+    Returns a score between 0 and 100.
+    """
+    if pe is None or pe <= 0:
+        return 50.0  # neutral if invalid
+    if pe < 10:
+        return 90.0
+    if pe < 20:
+        return 80.0
+    if pe < 30:
+        return 65.0
+    if pe < 50:
+        return 50.0
+    if pe < 80:
+        return 40.0
+    return 30.0
+
+
+def score_margin(margin: float) -> float:
+    """
+    Score profit margins (0-1) into 0-100.
+    """
+    if margin is None:
+        return 50.0
+    # Cap at 40% margin
+    margin = max(min(margin, 0.4), -0.4)
+    # Map [-40%, 40%] to [0, 100]
+    return (margin + 0.4) / 0.8 * 100.0
+
+
+def score_growth(growth: float) -> float:
+    """
+    Score revenue or earnings growth (approx in 0-1 range) into 0-100.
+    """
+    if growth is None:
+        return 50.0
+    # Cap growth between -50% and +50%
+    growth = max(min(growth, 0.5), -0.5)
+    return (growth + 0.5) / 1.0 * 100.0
+
+
+def score_debt_to_equity(de: float) -> float:
+    """
+    Score debt-to-equity: lower is better.
+    """
+    if de is None or de < 0:
+        return 50.0
+    if de < 0.5:
+        return 85.0
+    if de < 1.0:
+        return 75.0
+    if de < 2.0:
+        return 60.0
+    if de < 3.0:
+        return 45.0
+    return 30.0
+
+
+def get_fundamental_scores(ticker: str):
+    """
+    Fetch some basic fundamentals via yfinance and convert them to 0-100 sub-scores.
+    Returns (factor_score, details_dict).
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        info = tk.info  # may be slow / partial but works for many tickers
+    except Exception:
+        info = {}
+
+    trailing_pe = safe_get(info, "trailingPE")
+    forward_pe = safe_get(info, "forwardPE")
+    profit_margin = safe_get(info, "profitMargins")
+    revenue_growth = safe_get(info, "revenueGrowth")
+    debt_to_equity = safe_get(info, "debtToEquity")
+
+    # Compute sub-scores
+    trailing_pe_score = score_pe(trailing_pe)
+    forward_pe_score = score_pe(forward_pe)
+    margin_score = score_margin(profit_margin)
+    growth_score = score_growth(revenue_growth)
+    de_score = score_debt_to_equity(debt_to_equity)
+
+    # Aggregate factor score as simple average of available scores
+    scores = [trailing_pe_score, forward_pe_score, margin_score, growth_score, de_score]
+    valid_scores = [s for s in scores if s is not None]
+
+    if len(valid_scores) == 0:
+        factor_score = 50.0
+    else:
+        factor_score = float(np.mean(valid_scores))
+
+    details = {
+        "trailingPE": trailing_pe,
+        "trailingPE_score": trailing_pe_score,
+        "forwardPE": forward_pe,
+        "forwardPE_score": forward_pe_score,
+        "profitMargins": profit_margin,
+        "profitMargins_score": margin_score,
+        "revenueGrowth": revenue_growth,
+        "revenueGrowth_score": growth_score,
+        "debtToEquity": debt_to_equity,
+        "debtToEquity_score": de_score,
+        "factor_score": factor_score,
+    }
+
+    return factor_score, details
+
+
+# =========================
+# ML Training + Brier Score
+# =========================
+
 def train_model_v2(X: pd.DataFrame, y: pd.Series, test_size: float = 0.2, random_state: int = 42):
     """
-    Train a RandomForest classifier and return model and basic performance metrics.
+    Train a RandomForest classifier and return model, accuracy, and Brier score.
     Uses a time-based split (no shuffling).
     """
     # Time-based split: earlier data = train, later data = test
@@ -105,13 +240,17 @@ def train_model_v2(X: pd.DataFrame, y: pd.Series, test_size: float = 0.2, random
     y_pred = model.predict(X_test)
     acc = accuracy_score(y_test, y_pred)
 
-    return model, acc
+    # Brier score for probability calibration (on class 1 = "UP")
+    proba_test = model.predict_proba(X_test)[:, 1]
+    brier = brier_score_loss(y_test, proba_test)
+
+    return model, acc, brier
 
 
 def predict_next_day_v2(model, X: pd.DataFrame):
     """
     Use a trained model and the latest feature row to predict next day UP/DOWN.
-    Returns direction, confidence, and raw probabilities.
+    Returns direction, confidence (raw prob), and probabilities.
     """
     latest_features = X.iloc[[-1]]  # keep as DataFrame
     proba = model.predict_proba(latest_features)[0]  # [P(0), P(1)]
@@ -124,19 +263,24 @@ def predict_next_day_v2(model, X: pd.DataFrame):
 
 
 # =========================
-# Streamlit App
+# Streamlit App (Hybrid)
 # =========================
 
 def main():
-    st.set_page_config(page_title="Stock Predictor V2 (ML)", page_icon="📈")
-    st.title("📈 Stock Predictor V2 (ML Model)")
+    st.set_page_config(page_title="Hybrid Stock Predictor (V2 ML + Fundamentals)", page_icon="📈")
+    st.title("📈 Hybrid Stock Predictor (ML + Fundamentals)")
     st.write(
         """
-        This app uses a machine-learning model (Random Forest) to analyze recent price action 
-        and predict whether a stock is more likely to go **UP or DOWN next trading day**, 
-        along with a **confidence percentage**.
+        This app uses a **hybrid approach**:
+        - A machine-learning model (Random Forest) on recent price action, and
+        - A simple fundamental factor score (P/E, margins, growth, debt)
+        
+        It predicts whether a stock is more likely to go **UP or DOWN next trading day**,
+        and assigns a **1–100 rating** plus a **confidence percentage**.
         """
     )
+
+    st.info("Phase 1 MVP focuses on the **1-day horizon** for a single ticker. Additional horizons and backtests will follow.")
 
     # Sidebar configuration
     st.sidebar.header("Configuration")
@@ -145,7 +289,7 @@ def main():
     ticker = st.sidebar.text_input("Ticker symbol", value=default_ticker).upper()
 
     lookback_years = st.sidebar.slider(
-        "Years of history to use",
+        "Years of history to use (for training)",
         min_value=1,
         max_value=10,
         value=3,
@@ -167,9 +311,9 @@ def main():
             st.error("Please enter a ticker symbol.")
             return
 
-        with st.spinner(f"Fetching data and training model for {ticker}..."):
+        with st.spinner(f"Fetching data, training ML model, and computing scores for {ticker}..."):
             try:
-                # 1) Get data
+                # 1) Get price data
                 data = get_price_history(ticker, lookback_years=lookback_years)
                 if data.empty:
                     st.error("No data returned. Please check the ticker symbol.")
@@ -178,17 +322,64 @@ def main():
                 # 2) Build features
                 df, X, y, feature_cols = build_features_v2(data)
 
-                if len(df) < 100:
+                if len(df) < 150:
                     st.warning(
                         "Not much historical data available after feature engineering. "
-                        "Predictions may be unreliable."
+                        "Predictions and calibration may be unreliable."
                     )
 
-                # 3) Train model
-                model, acc = train_model_v2(X, y, test_size=test_size)
+                # 3) Train model (ML)
+                model, acc, brier = train_model_v2(X, y, test_size=test_size)
 
-                # 4) Predict next day
-                direction, confidence, p_up, p_down = predict_next_day_v2(model, X)
+                # 4) Predict next day via ML
+                direction_ml, confidence_ml, p_up, p_down = predict_next_day_v2(model, X)
+
+                # 5) Compute ML-based score (1-100). p_up in [0,1]:
+                # p_up = 0.5 -> 50 (neutral), p_up close to 1 -> 100, p_up close to 0 -> 0
+                ml_score = p_up * 100.0
+
+                # 6) Fundamentals factor score
+                factor_score, factor_details = get_fundamental_scores(ticker)
+
+                # 7) Hybrid final score (1–100) as weighted combination
+                final_score = 0.7 * ml_score + 0.3 * factor_score
+                final_score = float(np.clip(final_score, 0.0, 100.0))
+
+                # 8) Direction from final score
+                direction_final = "UP" if final_score > 50.0 else "DOWN"
+
+                # 9) Confidence percentage (blend of ML margin and Brier calibration)
+                # Model confidence based on distance from 50% probability
+                model_margin = abs(p_up - 0.5) * 2.0  # 0 (uncertain) to 1 (very certain)
+
+                # Brier score: lower is better; we invert it for confidence contribution
+                # Clip to [0, 1] range for safety
+                brier_clipped = float(np.clip(brier, 0.0, 1.0))
+                calibration_factor = 1.0 - brier_clipped  # higher is better
+
+                raw_confidence = model_margin * calibration_factor
+                confidence_pct = float(np.clip(raw_confidence * 100.0, 0.0, 100.0))
+
+                # 10) Build a one-row DataFrame for export and display
+                latest_row = df.iloc[-1]
+                last_date = latest_row.name.date()
+                last_close = latest_row["Close"]
+
+                result_row = {
+                    "ticker": ticker,
+                    "last_date": last_date,
+                    "last_close": last_close,
+                    "final_score_1d": final_score,
+                    "direction_1d": direction_final,
+                    "confidence_pct": confidence_pct,
+                    "p_up_1d": p_up,
+                    "p_down_1d": p_down,
+                    "ml_score_1d": ml_score,
+                    "factor_score": factor_score,
+                    "backtest_accuracy": acc,
+                    "brier_score": brier,
+                }
+                result_df = pd.DataFrame([result_row])
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
@@ -197,46 +388,86 @@ def main():
         # =========================
         # Display Results
         # =========================
-        latest_row = df.iloc[-1]
-        last_date = latest_row.name.date()
-        last_close = latest_row["Close"]
-
         st.subheader(f"Results for {ticker}")
-        col1, col2 = st.columns(2)
+
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Last close date", str(last_date))
             st.metric("Last close price", f"${last_close:,.2f}")
         with col2:
-            st.metric("Backtest accuracy (hold-out)", f"{acc * 100:.1f}%")
+            st.metric("Hybrid score (1-day, 1–100)", f"{final_score:.1f}")
+            st.metric("Predicted direction (1-day)", direction_final)
+        with col3:
+            st.metric("Confidence % (hybrid)", f"{confidence_pct:.1f}%")
+            st.metric("Brier score (hold-out)", f"{brier:.3f}")
 
         st.markdown("---")
-        st.subheader("📊 Next-Day Prediction")
+        st.subheader("🔎 ML Probability & Factor Breakdown")
 
-        st.write(f"**Direction:** `{direction}`")
-        st.write(f"**Confidence:** `{confidence * 100:.1f}%`")
-
-        st.write(
-            f"- Probability stock will **go UP** next day: `{p_up * 100:.1f}%`  \n"
-            f"- Probability stock will **go DOWN** next day: `{p_down * 100:.1f}%`"
-        )
+        st.write(f"**ML Probability stock goes UP next day (p_up):** `{p_up * 100:.1f}%`")
+        st.write(f"**ML Probability stock goes DOWN next day (p_down):** `{p_down * 100:.1f}%`")
+        st.write(f"**ML-only score (1–100):** `{ml_score:.1f}`")
+        st.write(f"**Factor-only score (1–100):** `{factor_score:.1f}`")
 
         st.info(
-            "Interpretation: This is a statistical model based on past price behavior. "
-            "It does **not** guarantee future performance and should not be treated as financial advice."
+            "The **hybrid score** combines the ML-based probability of going up with a basic fundamental score "
+            "to produce a 1–100 rating, where 1 = very bearish, 50 = neutral, 100 = very bullish."
         )
+
+        # Show fundamental details
+        st.markdown("#### Fundamental factors (raw + scores)")
+        factor_table = pd.DataFrame({
+            "metric": [
+                "trailingPE", "forwardPE", "profitMargins",
+                "revenueGrowth", "debtToEquity"
+            ],
+            "raw_value": [
+                factor_details["trailingPE"],
+                factor_details["forwardPE"],
+                factor_details["profitMargins"],
+                factor_details["revenueGrowth"],
+                factor_details["debtToEquity"]
+            ],
+            "score_0_100": [
+                factor_details["trailingPE_score"],
+                factor_details["forwardPE_score"],
+                factor_details["profitMargins_score"],
+                factor_details["revenueGrowth_score"],
+                factor_details["debtToEquity_score"],
+            ]
+        })
+        st.dataframe(factor_table)
 
         # =========================
         # Charts
         # =========================
         st.markdown("---")
-        st.subheader("Price History")
+        st.subheader("Price History (Close)")
 
         price_to_show = df[["Close"]].copy()
-        price_to_show.index = price_to_show.index.tz_localize(None)  # handle tz issues for plotting
+        try:
+            # Handle possible timezone issues for plotting
+            price_to_show.index = price_to_show.index.tz_localize(None)
+        except Exception:
+            pass
         st.line_chart(price_to_show)
 
         st.subheader("Recent Features Snapshot (Last 10 Days)")
         st.dataframe(df[feature_cols + ["target"]].tail(10))
+
+        # =========================
+        # Downloadable Result
+        # =========================
+        st.markdown("---")
+        st.subheader("Export Prediction")
+
+        csv_bytes = result_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download 1-day prediction as CSV",
+            data=csv_bytes,
+            file_name=f"{ticker}_hybrid_prediction_1d.csv",
+            mime="text/csv"
+        )
 
 
 if __name__ == "__main__":
