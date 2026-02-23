@@ -48,7 +48,7 @@ def build_features_v2(data: pd.DataFrame):
 
     # Moving averages
     df["SMA_10"] = df["Close"].rolling(window=10).mean()
-    df["SMA_30"] = df["Close"].rolling(window=30).mean()
+    df["SMA_30"] = df["Close"] .rolling(window=30).mean()
     df["SMA_ratio_10_30"] = df["SMA_10"] / (df["SMA_30"] + 1e-9)
 
     # RSI
@@ -78,6 +78,7 @@ def build_features_v2(data: pd.DataFrame):
 # =========================
 # Fundamental Factor Scoring
 # =========================
+
 
 def safe_get(info: dict, key: str, default=None):
     # Safe dictionary access for yfinance .info.
@@ -190,6 +191,7 @@ def get_fundamental_scores(ticker: str):
 # ML Training + Manual Brier Score
 # =========================
 
+
 def train_model_v2(X: pd.DataFrame, y: pd.Series, test_size: float = 0.2, random_state: int = 42):
     # Train a RandomForest classifier and return model, accuracy, and Brier score.
     # Uses a time-based split (no shuffling).
@@ -237,6 +239,7 @@ def predict_next_day_v2(model, X: pd.DataFrame):
 # =========================
 # Streamlit App (Hybrid)
 # =========================
+
 
 def main():
     st.set_page_config(page_title="Hybrid Stock Predictor (V2 ML + Fundamentals)", page_icon="📈")
@@ -334,7 +337,9 @@ def main():
                 result_df = pd.DataFrame([result_row])
 
             except Exception as e:
+                import traceback
                 st.error(f"Something went wrong: {e}")
+                st.code(traceback.format_exc())
                 return
 
         st.subheader(f"Results for {ticker}")
