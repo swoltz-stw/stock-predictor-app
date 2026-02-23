@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, brier_score_loss
+from sklearn.metrics import accuracy_score
 
 
 # =========================
@@ -208,7 +208,7 @@ def get_fundamental_scores(ticker: str):
 
 
 # =========================
-# ML Training + Brier Score
+# ML Training + Manual Brier Score
 # =========================
 
 def train_model_v2(X: pd.DataFrame, y: pd.Series, test_size: float = 0.2, random_state: int = 42):
@@ -234,16 +234,19 @@ def train_model_v2(X: pd.DataFrame, y: pd.Series, test_size: float = 0.2, random
     # Predictions on hold-out test set
     y_pred = model.predict(X_test)
 
-    # Ensure y_test is 1D
+    # Ensure arrays are 1D
     y_test_1d = np.ravel(y_test)
+    y_pred_1d = np.ravel(y_pred)
 
     # Accuracy
-    acc = accuracy_score(y_test_1d, y_pred)
+    acc = accuracy_score(y_test_1d, y_pred_1d)
 
-    # Brier score for probability calibration (class 1 = "UP")
+    # Manual Brier score for probability calibration (class 1 = "UP")
     proba_test = model.predict_proba(X_test)[:, 1]
     proba_test_1d = np.ravel(proba_test)
-    brier = brier_score_loss(y_test_1d, proba_test_1d)
+
+    # Brier = mean((p - y)^2)
+    brier = float(np.mean((proba_test_1d - y_test_1d) ** 2))
 
     return model, acc, brier
 
@@ -350,9 +353,9 @@ def main():
 
                 # 9) Confidence percentage: blend of ML margin and calibration (Brier)
                 model_margin = abs(p_up - 0.5) * 2.0  # 0 to 1
-                brier_clipped = float(np.clip(brier, 0.0, 1.0))
-                calibration_factor = 1.0 - brier_clipped  # higher is better
-                raw_confidence = model_margin * calibration_factor
+                # Scale Brier into [0, 1] range crudely: assume 0 to 0.25 typical
+                brier_scaled = 1.0 - np.clip(brier / 0.25, 0.0, 1.0)
+                raw_confidence = model_margin * brier_scaled
                 confidence_pct = float(np.clip(raw_confidence * 100.0, 0.0, 100.0))
 
                 # 10) Build a one-row DataFrame for export and display
